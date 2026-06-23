@@ -8,8 +8,13 @@ from rich.table import Table
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 
+from kuberef.ndjson_streaming import NDJSONEventStream
+
 app = typer.Typer()
 console = Console()
+
+# Global NDJSON event stream (will be initialized based on flags)
+stream: NDJSONEventStream = None
 
 
 def find_pod_specs(data: Any) -> List[Dict[str, Any]]:
@@ -67,7 +72,7 @@ def build_summary(files_scanned: int, passed: int, failed: int, warnings: int, f
         "files": files,
     }
 
-def run_audit(files_to_scan: List[Path], namespace: str, v1: Any, quiet: bool = False, json_output: bool = False) -> int:
+def run_audit(files_to_scan: List[Path], namespace: str, v1: Any, quiet: bool = False, json_output: bool = False, watch: bool = False) -> int:
     """
     Core audit logic. Scans the given files against the live cluster.
     Returns exit code: 0 for clean, 1 for failures/warnings.
@@ -88,9 +93,9 @@ def run_audit(files_to_scan: List[Path], namespace: str, v1: Any, quiet: bool = 
             except yaml.YAMLError:
                 if json_output:
                    json_results.append({
-                       "file": yaml_file.name,
-                       "status": "INVALID_YAML"
-                   })
+                        "file": yaml_file.name,
+                        "status": "INVALID_YAML"
+                    })
                 else:
                     console.print(
                        f"[bold red]Error:[/bold red] Invalid YAML format in {yaml_file.name}. Skipping..."
@@ -156,8 +161,13 @@ def run_audit(files_to_scan: List[Path], namespace: str, v1: Any, quiet: bool = 
             console.print(table)
 
     summary = build_summary(len(files_to_scan), global_passed, global_failed, global_warnings, json_results)
-    if json_output:
-        print(json.dumps(summary, indent=2))        
+    
+    # Emit NDJSON audit_summary if streaming is enabled
+    if stream and stream.enabled:
+        stream.emit_audit_summary(summary)
+    elif json_output:
+        # Standard JSON output (with indentation) when not in watch mode
+        print(json.dumps(summary, indent=2))
     else:
         console.print("\n" + "━" * 30)
         console.print("[bold underline]AUDIT SUMMARY[/bold underline]\n")
@@ -212,7 +222,15 @@ Examples:
   kuberef deployment.yaml --watch     # Re-audit automatically on file changes
   kuberef ./k8s-manifests/ -w         # Watch an entire directory
 
+Watch mode with JSON (NDJSON streaming):
+  kuberef ./k8s-manifests/ --watch --json | jq 'select(.event == "audit_summary")'
+
 """
+    global stream
+    
+    # Initialize NDJSON streaming if both --watch and --json are active
+    stream = NDJSONEventStream(enabled=(watch and json_output))
+    
     target_path = Path(path_str)
 
     files_to_scan: List[Path] = []
@@ -221,11 +239,13 @@ Examples:
     elif target_path.is_file():
         files_to_scan = [target_path]
     else:
-        console.print(f"[bold red]Error:[/bold red] Path {path_str} not found!")
+        if not stream.enabled:
+            console.print(f"[bold red]Error:[/bold red] Path {path_str} not found!")
         raise typer.Exit(1)
 
     if not files_to_scan:
-        console.print(f"[yellow]No YAML files found at {path_str}[/yellow]")
+        if not stream.enabled:
+            console.print(f"[yellow]No YAML files found at {path_str}[/yellow]")
         return
 
     try:
@@ -234,13 +254,16 @@ Examples:
         cluster_name = active_context["name"]
         v1 = client.CoreV1Api()
         v1.read_namespace(name=namespace)
-        if not json_output:
+        # Suppress cluster info output when NDJSON streaming is enabled
+        if not stream.enabled:
            console.print(f"[bold blue]Target Cluster:[/bold blue] {cluster_name}")
     except Exception as e:
-        console.print(f"[bold red]Pre-flight Error:[/bold red] {str(e)}")
+        if not stream.enabled:
+            console.print(f"[bold red]Pre-flight Error:[/bold red] {str(e)}")
         raise typer.Exit(1)
 
-    exit_code = run_audit(files_to_scan, namespace, v1, quiet=quiet, json_output=json_output)
+    # Initial audit before entering watch mode
+    exit_code = run_audit(files_to_scan, namespace, v1, quiet=quiet, json_output=json_output, watch=watch)
 
     if watch:
         from kuberef.watcher import run_watch_mode
@@ -250,9 +273,17 @@ Examples:
                 updated_files = get_yaml_files(target_path)
             else:
                 updated_files = [changed_path]
-            run_audit(updated_files, namespace, v1, quiet=quiet, json_output=json_output)
+            run_audit(updated_files, namespace, v1, quiet=quiet, json_output=json_output, watch=watch)
 
-        run_watch_mode(target_path, _on_change)
+        # Emit watcher_started event if NDJSON streaming is enabled
+        if stream.enabled:
+            stream.emit_watcher_started(str(target_path))
+        
+        run_watch_mode(target_path, _on_change, stream=stream)
+        
+        # Emit watcher_stopped event if NDJSON streaming is enabled
+        if stream.enabled:
+            stream.emit_watcher_stopped()
     else:
         raise typer.Exit(exit_code)
 
